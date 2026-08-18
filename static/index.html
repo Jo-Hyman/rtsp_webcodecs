@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RTSP WebCodecs Player (H264 / H265)</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 20px; background: #111; color: #eee; }
+  .bar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  input[type=text] { flex: 1; min-width: 260px; padding: 8px; border-radius: 6px; border: 1px solid #444; background: #222; color: #eee; }
+  button { padding: 8px 18px; border-radius: 6px; border: none; background: #2f6fdf; color: #fff; cursor: pointer; }
+  button:hover { background: #3f7fef; }
+  #status { margin: 10px 0; font-size: 13px; color: #9db2ff; min-height: 18px; white-space: pre-wrap; }
+  #status.error { color: #ff8080; }
+  canvas { width: 100%; max-width: 1280px; background: #000; border-radius: 8px; display: block; }
+  .hint { color: #888; font-size: 12px; margin-top: 10px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<h2>RTSP Player（WebCodecs 解码 H264 / H265）</h2>
+<div class="bar">
+  <input type="text" id="url" placeholder="rtsp://user:pass@host:554/stream" value="">
+  <button id="play">播放 / 停止</button>
+</div>
+<div id="status"></div>
+<canvas id="video"></canvas>
+<div class="hint">
+  注意：H.265（HEVC）WebCodecs 解码目前只有 Safari 以及部分浏览器开启硬件支持后才可用；
+  H.264 在 Chrome / Edge / Firefox / Safari 均可使用。
+</div>
+
+<script>
+const canvas = document.getElementById('video');
+const ctx = canvas.getContext('2d');
+const urlInput = document.getElementById('url');
+const playBtn = document.getElementById('play');
+const statusEl = document.getElementById('status');
+
+let ws = null;
+let decoder = null;
+let decodedFrames = 0;
+
+function setStatus(text, isError) {
+  statusEl.textContent = text;
+  statusEl.className = isError ? 'error' : '';
+}
+
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+async function setupDecoder(cfg) {
+  if (decoder) {
+    decoder.close();
+    decoder = null;
+  }
+  decodedFrames = 0;
+
+  const description = b64ToBytes(cfg.description);
+  const codec = cfg.codecString;
+
+  const support = await VideoDecoder.isConfigSupported({ codec, description });
+  if (!support.supported) {
+    setStatus('解码器不支持 ' + codec + '（Windows 请安装商店的 "HEVC Video Extensions" 并开启硬件加速；或改用 Edge/Safari）', true);
+    return;
+  }
+
+  decoder = new VideoDecoder({
+    output(frame) {
+      canvas.width = frame.displayWidth;
+      canvas.height = frame.displayHeight;
+      ctx.drawImage(frame, 0, 0);
+      frame.close();
+      decodedFrames++;
+      setStatus('正在播放 ' + (cfg ? cfg.codec : '') + ' — 已解码 ' + decodedFrames + ' 帧');
+    },
+    error(e) {
+      setStatus('解码错误: ' + e.message, true);
+    }
+  });
+  const cfgOpts2 = { codec, description };
+  decoder.configure(cfgOpts2);
+  setStatus('正在播放 ' + cfg.codec.toUpperCase() + '（' + codec + '）');
+}
+
+// 每个二进制消息: [1字节 key 标志][8字节微秒时间戳][AVCC 长度前缀码流]
+function feed(ev) {
+  if (!decoder || decoder.state !== 'configured') return;
+  const buf = ev.data;
+  if (!(buf instanceof ArrayBuffer)) return;
+
+  const dv = new DataView(buf);
+  const key = dv.getUint8(0) === 1;
+  const ts = Number(dv.getBigUint64(1));
+  const data = new Uint8Array(buf, 9, buf.byteLength - 9);
+
+  const chunk = new EncodedVideoChunk({
+    type: key ? 'key' : 'delta',
+    timestamp: ts,
+    data
+  });
+  decoder.decode(chunk);
+}
+
+function connect() {
+  const rtspUrl = urlInput.value.trim();
+  if (!rtspUrl) { setStatus('请输入 RTSP 地址', true); return; }
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(proto + '://' + location.host + '/ws?url=' + encodeURIComponent(rtspUrl));
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => setStatus('连接中...');
+  ws.onmessage = async (ev) => {
+    if (typeof ev.data === 'string') {
+      const msg = JSON.parse(ev.data);
+      if (msg.error) { setStatus('服务端错误: ' + msg.error, true); return; }
+      await setupDecoder(msg);
+    } else {
+      feed(ev);
+    }
+  };
+  ws.onerror = () => setStatus('WebSocket 连接失败', true);
+  ws.onclose = () => {
+    setStatus('连接已关闭');
+    if (decoder) { decoder.close(); decoder = null; }
+    ws = null;
+  };
+}
+
+function stop() {
+  if (ws) { ws.close(); ws = null; }
+}
+
+playBtn.onclick = () => {
+  if (ws) stop();
+  else connect();
+};
+
+const preset = new URLSearchParams(location.search).get('rtsp');
+if (preset) {
+  urlInput.value = preset;
+  connect();
+}
+</script>
+</body>
+</html>
